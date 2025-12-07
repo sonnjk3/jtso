@@ -1,4 +1,4 @@
-FROM golang:alpine as builder
+FROM golang:alpine AS builder
 ARG LDFLAGS=""
 
 RUN apk --update --no-cache add git build-base gcc

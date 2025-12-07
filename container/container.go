@@ -6,13 +6,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"jtso/logger"
+	"maps"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/client"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/client"
 )
 
 type ContainerStats struct {
@@ -30,7 +31,7 @@ func Init(i int) {
 	Cstats.StMu = new(sync.Mutex)
 }
 
-func calculateCPUPercent(current, previous types.StatsJSON) float64 {
+func calculateCPUPercent(current, previous container.StatsResponse) float64 {
 	cpuDelta := float64(current.CPUStats.CPUUsage.TotalUsage - previous.CPUStats.CPUUsage.TotalUsage)
 	systemDelta := float64(current.CPUStats.SystemUsage - previous.CPUStats.SystemUsage)
 	onlineCPUs := float64(current.CPUStats.OnlineCPUs)
@@ -44,20 +45,20 @@ func calculateCPUPercent(current, previous types.StatsJSON) float64 {
 	return (cpuDelta / systemDelta) * onlineCPUs * 100.0
 }
 
-func collectStats(cli *client.Client, container types.Container, resultChan chan<- map[string]map[string]float64, wg *sync.WaitGroup) {
+func collectStats(cli *client.Client, containerSummary container.Summary, resultChan chan<- map[string]map[string]float64, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	// Get initial stats
-	stats, err := cli.ContainerStats(context.Background(), container.ID, false)
+	stats, err := cli.ContainerStats(context.Background(), containerSummary.ID, client.ContainerStatsOptions{Stream: false})
 	if err != nil {
-		resultChan <- map[string]map[string]float64{container.Names[0]: {"error": 1.0}}
+		resultChan <- map[string]map[string]float64{containerSummary.Names[0]: {"error": 1.0}}
 		return
 	}
 	defer stats.Body.Close()
 
-	var prevStats types.StatsJSON
+	var prevStats container.StatsResponse
 	if err := json.NewDecoder(stats.Body).Decode(&prevStats); err != nil {
-		resultChan <- map[string]map[string]float64{container.Names[0]: {"error": 1.0}}
+		resultChan <- map[string]map[string]float64{containerSummary.Names[0]: {"error": 1.0}}
 		return
 	}
 
@@ -65,16 +66,16 @@ func collectStats(cli *client.Client, container types.Container, resultChan chan
 	time.Sleep(time.Duration(Cstats.Interval) * time.Second)
 
 	// Get next stats
-	stats, err = cli.ContainerStats(context.Background(), container.ID, false)
+	stats, err = cli.ContainerStats(context.Background(), containerSummary.ID, client.ContainerStatsOptions{Stream: false})
 	if err != nil {
-		resultChan <- map[string]map[string]float64{container.Names[0]: {"error": 1.0}}
+		resultChan <- map[string]map[string]float64{containerSummary.Names[0]: {"error": 1.0}}
 		return
 	}
 	defer stats.Body.Close()
 
-	var currentStats types.StatsJSON
+	var currentStats container.StatsResponse
 	if err := json.NewDecoder(stats.Body).Decode(&currentStats); err != nil {
-		resultChan <- map[string]map[string]float64{container.Names[0]: {"error": 1.0}}
+		resultChan <- map[string]map[string]float64{containerSummary.Names[0]: {"error": 1.0}}
 		return
 	}
 
@@ -94,7 +95,7 @@ func collectStats(cli *client.Client, container types.Container, resultChan chan
 	}
 
 	// Format results
-	containerName := strings.TrimPrefix(container.Names[0], "/")
+	containerName := strings.TrimPrefix(containerSummary.Names[0], "/")
 	resultChan <- map[string]map[string]float64{
 		containerName: {
 			"cpu": cpuPercent,
@@ -108,26 +109,24 @@ func GetContainerLogs(containerName string) ([]string, error) {
 	logLines = make([]string, 0)
 
 	// Open Docker API
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	cli, err := client.New(client.FromEnv)
 	if err != nil {
 		logger.Log.Errorf("Unable to open Docker session: %v", err)
 		return logLines, err
 	}
 	defer cli.Close()
 
-	containers, err := cli.ContainerList(context.Background(), types.ContainerListOptions{All: true})
+	containers, err := cli.ContainerList(context.Background(), client.ContainerListOptions{All: true})
 	if err != nil {
 		logger.Log.Errorf("Unable to list the containers: %v", err)
 		return logLines, err
 	}
 
 	var containerID string
-	for _, container := range containers {
-		for _, name := range container.Names {
-			if name == "/"+containerName {
-				containerID = container.ID
-				break
-			}
+	for _, containerSummary := range containers.Items {
+		if slices.Contains(containerSummary.Names, "/"+containerName) {
+			containerID = containerSummary.ID
+			break
 		}
 	}
 
@@ -137,7 +136,7 @@ func GetContainerLogs(containerName string) ([]string, error) {
 	}
 
 	ctx := context.Background()
-	options := types.ContainerLogsOptions{
+	options := client.ContainerLogsOptions{
 		ShowStdout: true,
 		ShowStderr: true,
 		Tail:       fmt.Sprintf("%d", 200),
@@ -171,14 +170,14 @@ func GetContainerStats() {
 	logger.Log.Debug("Start collecting container stats")
 
 	// Initialize Docker client
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	cli, err := client.New(client.FromEnv)
 	if err != nil {
 		logger.Log.Errorf("Error creating Docker client: %v\n", err)
 		return
 	}
 
 	// Get list of containers
-	containers, err := cli.ContainerList(context.Background(), types.ContainerListOptions{})
+	containers, err := cli.ContainerList(context.Background(), client.ContainerListOptions{})
 	if err != nil {
 		logger.Log.Errorf("Error listing containers: %v\n", err)
 		return
@@ -186,12 +185,12 @@ func GetContainerStats() {
 
 	// Set up synchronization
 	var wg sync.WaitGroup
-	resultChan := make(chan map[string]map[string]float64, len(containers))
+	resultChan := make(chan map[string]map[string]float64, len(containers.Items))
 
 	// Collect stats in parallel
-	for _, container := range containers {
+	for _, containerSummary := range containers.Items {
 		wg.Add(1)
-		go collectStats(cli, container, resultChan, &wg)
+		go collectStats(cli, containerSummary, resultChan, &wg)
 	}
 
 	// Wait for all goroutines to finish
@@ -202,34 +201,32 @@ func GetContainerStats() {
 	Cstats.StMu.Lock()
 	Cstats.Stats = make(map[string]map[string]float64)
 	for result := range resultChan {
-		for containerName, stats := range result {
-			Cstats.Stats[containerName] = stats
-		}
+		maps.Copy(Cstats.Stats, result)
 	}
 	Cstats.StMu.Unlock()
 	logger.Log.Debug("End of the container stats collection")
 }
 
-func ListContainers() []types.Container {
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+func ListContainers() []container.Summary {
+	cli, err := client.New(client.FromEnv)
 	if err != nil {
 		logger.Log.Errorf("Unable to open Docker session: %v", err)
 	}
 	defer cli.Close()
 
-	containers, err := cli.ContainerList(context.Background(), types.ContainerListOptions{})
+	containers, err := cli.ContainerList(context.Background(), client.ContainerListOptions{})
 	if err != nil {
 		logger.Log.Errorf("Unable to list container state: %v", err)
 	}
 	logger.Log.Debug("List of containers has been retrieved")
-	return containers
+	return containers.Items
 }
 
 func RestartContainer(name string) error {
 	timeout := 30
 
 	// Open Docker API
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	cli, err := client.New(client.FromEnv)
 	if err != nil {
 		logger.Log.Errorf("Unable to open Docker session: %v", err)
 		return err
@@ -237,7 +234,7 @@ func RestartContainer(name string) error {
 	defer cli.Close()
 
 	// Restart container
-	err = cli.ContainerRestart(context.Background(), name, container.StopOptions{Signal: "SIGTERM", Timeout: &timeout})
+	_, err = cli.ContainerRestart(context.Background(), name, client.ContainerRestartOptions{Signal: "SIGTERM", Timeout: &timeout})
 	if err != nil {
 		logger.Log.Errorf("Unable to restart %s container: %v", name, err)
 		return err
@@ -251,14 +248,14 @@ func StopContainer(name string) {
 	timeout := 30
 
 	// Open Docker API
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	cli, err := client.New(client.FromEnv)
 	if err != nil {
 		logger.Log.Errorf("Unable to open Docker session: %v", err)
 		return
 	}
 	defer cli.Close()
 
-	err = cli.ContainerStop(context.Background(), name, container.StopOptions{Signal: "SIGTERM", Timeout: &timeout})
+	_, err = cli.ContainerStop(context.Background(), name, client.ContainerStopOptions{Signal: "SIGTERM", Timeout: &timeout})
 	if err != nil {
 		logger.Log.Errorf("Unable to stop %s container: %v", name, err)
 		return
@@ -270,7 +267,7 @@ func StopContainer(name string) {
 func GetVersionLabel(name string) string {
 
 	// Open Docker API
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	cli, err := client.New(client.FromEnv)
 	if err != nil {
 		logger.Log.Errorf("Unable to open Docker session: %v", err)
 		return "N/A"
@@ -278,7 +275,7 @@ func GetVersionLabel(name string) string {
 	defer cli.Close()
 
 	// Get the image details using the Docker API
-	imageInspect, _, err := cli.ImageInspectWithRaw(context.Background(), name)
+	imageInspect, err := cli.ImageInspect(context.Background(), name)
 	if err != nil {
 		logger.Log.Errorf("Unable to retrieve Docker %s inspect data: %v", name, err)
 		return "N/A"
